@@ -1,0 +1,52 @@
+name: Publish finished private release
+
+on:
+  repository_dispatch:
+    types: [publish-private-release]
+  workflow_dispatch:
+    inputs:
+      private_repository:
+        description: "Private repository, for example OWNER/aimind-private"
+        required: true
+      version:
+        description: "Private release tag, for example v0.2.4"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      PRIVATE_REPOSITORY: ${{ github.event.client_payload.private_repository || inputs.private_repository }}
+      VERSION: ${{ github.event.client_payload.version || inputs.version }}
+      GH_TOKEN: ${{ secrets.PRIVATE_ARTIFACT_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download finished installers from private release
+        shell: bash
+        run: |
+          test -n "$PRIVATE_REPOSITORY"
+          test -n "$VERSION"
+          mkdir -p release-assets
+          gh release download "$VERSION" \
+            --repo "$PRIVATE_REPOSITORY" \
+            --dir release-assets
+          test -n "$(find release-assets -type f -print -quit)"
+
+      - name: Publish assets to public GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mapfile -d '' ASSETS < <(find release-assets -type f -print0)
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$VERSION" "${ASSETS[@]}" \
+              --title "$VERSION" \
+              --generate-notes
+          fi
