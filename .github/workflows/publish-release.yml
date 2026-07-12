@@ -6,11 +6,18 @@ on:
   workflow_dispatch:
     inputs:
       private_repository:
-        description: "Private repository, for example OWNER/aimind-private"
+        description: "Private repository, for example OWNER/aimind"
         required: true
       version:
-        description: "Private release tag, for example v0.2.4"
+        description: "Private release tag, for example v0.2.4-rc.1 or v0.2.4"
         required: true
+      channel:
+        description: "Release channel"
+        required: true
+        type: choice
+        options:
+          - prerelease
+          - latest
 
 permissions:
   contents: write
@@ -21,20 +28,48 @@ jobs:
     env:
       PRIVATE_REPOSITORY: ${{ github.event.client_payload.private_repository || inputs.private_repository }}
       VERSION: ${{ github.event.client_payload.version || inputs.version }}
+      REQUESTED_CHANNEL: ${{ github.event.client_payload.channel || inputs.channel }}
       GH_TOKEN: ${{ secrets.PRIVATE_ARTIFACT_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download finished installers from private release
+      - name: Validate release channel
         shell: bash
         run: |
           test -n "$PRIVATE_REPOSITORY"
           test -n "$VERSION"
+          if [[ "$VERSION" == *-* ]]; then
+            DETECTED_CHANNEL=prerelease
+          else
+            DETECTED_CHANNEL=latest
+          fi
+          if [[ "$REQUESTED_CHANNEL" != "$DETECTED_CHANNEL" ]]; then
+            echo "Requested channel $REQUESTED_CHANNEL conflicts with tag $VERSION ($DETECTED_CHANNEL)."
+            exit 1
+          fi
+          echo "RELEASE_CHANNEL=$DETECTED_CHANNEL" >> "$GITHUB_ENV"
+
+      - name: Download finished installers and notes from private release
+        shell: bash
+        run: |
           mkdir -p release-assets
           gh release download "$VERSION" \
             --repo "$PRIVATE_REPOSITORY" \
             --dir release-assets
+          gh release view "$VERSION" \
+            --repo "$PRIVATE_REPOSITORY" \
+            --json body,isPrerelease \
+            --jq '.body // ""' > release-notes.md
+          PRIVATE_IS_PRERELEASE="$(gh release view "$VERSION" --repo "$PRIVATE_REPOSITORY" --json isPrerelease --jq .isPrerelease)"
+          if [[ "$RELEASE_CHANNEL" == prerelease && "$PRIVATE_IS_PRERELEASE" != true ]]; then
+            echo "Private release is not marked as a pre-release."
+            exit 1
+          fi
+          if [[ "$RELEASE_CHANNEL" == latest && "$PRIVATE_IS_PRERELEASE" != false ]]; then
+            echo "Private stable release is unexpectedly marked as a pre-release."
+            exit 1
+          fi
           test -n "$(find release-assets -type f -print -quit)"
 
       - name: Publish assets to public GitHub release
@@ -45,8 +80,19 @@ jobs:
           mapfile -d '' ASSETS < <(find release-assets -type f -print0)
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release upload "$VERSION" "${ASSETS[@]}" --clobber
+            if [[ "$RELEASE_CHANNEL" == prerelease ]]; then
+              gh release edit "$VERSION" --notes-file release-notes.md --prerelease
+            else
+              gh release edit "$VERSION" --notes-file release-notes.md --prerelease=false --latest
+            fi
+          elif [[ "$RELEASE_CHANNEL" == prerelease ]]; then
+            gh release create "$VERSION" "${ASSETS[@]}" \
+              --title "$VERSION" \
+              --notes-file release-notes.md \
+              --prerelease
           else
             gh release create "$VERSION" "${ASSETS[@]}" \
               --title "$VERSION" \
-              --generate-notes
+              --notes-file release-notes.md \
+              --latest
           fi
